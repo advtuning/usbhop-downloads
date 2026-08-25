@@ -1,0 +1,48 @@
+[Unit]
+Description=USB HOP Linux Client privileged VHCI helper
+After=local-fs.target
+Before=usbip-linux-client.service
+ConditionPathExists=/etc/usbip-vhci-helper/authority.v1
+
+[Service]
+Type=simple
+User=root
+Group=usbip
+UMask=0007
+ExecStart=/usr/libexec/usbip-client/usbip-linux-vhci-helper --serve
+# The helper journal, not process lifetime, owns an attached VHCI port. A stop
+# removes only the listening socket; restart performs exact journal recovery.
+ExecStopPost=/usr/bin/rm -f -- /run/usbip-vhci-helper/control.sock
+Restart=always
+RestartSec=1s
+RuntimeDirectory=usbip-vhci-helper
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=restart
+StateDirectory=usbip-vhci-helper
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/run/usbip-vhci-helper /var/lib/usbip-vhci-helper
+ReadOnlyPaths=/run/vhci_hcd
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN
+AmbientCapabilities=
+DevicePolicy=closed
+SystemCallArchitectures=native
+SystemCallFilter=@system-service @network-io
+SystemCallErrorNumber=EPERM
+MemoryDenyWriteExecute=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+
+[Install]
+WantedBy=multi-user.target

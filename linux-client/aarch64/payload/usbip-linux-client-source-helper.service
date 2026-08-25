@@ -1,0 +1,46 @@
+[Unit]
+Description=USB HOP Linux Client privileged local USB source helper
+After=local-fs.target
+Before=usbip-linux-client.service
+
+[Service]
+Type=simple
+User=root
+Group=usbip
+UMask=0007
+ExecStart=/usr/libexec/usbip-client/usbip-linux-client-source-helper
+Restart=always
+RestartSec=1s
+KillMode=control-group
+RuntimeDirectory=usbip-source-helper
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=no
+StateDirectory=usbip/client-source-helper
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+BindPaths=/dev/bus/usb
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/run/usbip-source-helper /var/lib/usbip/client-source-helper
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_CHOWN
+AmbientCapabilities=
+DevicePolicy=closed
+DeviceAllow=char-usb_device rw
+SystemCallArchitectures=native
+SystemCallFilter=@system-service @network-io
+SystemCallErrorNumber=EPERM
+MemoryDenyWriteExecute=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+
+[Install]
+WantedBy=multi-user.target

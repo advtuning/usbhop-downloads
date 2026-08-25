@@ -1,0 +1,46 @@
+[Unit]
+Description=USB HOP Linux Client fabric agent
+After=network-online.target usbip-linux-client-vhci.service usbip-linux-client-source-helper.service
+Wants=network-online.target
+Requires=usbip-linux-client-vhci.service usbip-linux-client-source-helper.service
+ConditionDirectoryNotEmpty=/var/lib/usbip/client/identity
+
+[Service]
+Type=simple
+User=@USBIP_CLIENT_USER@
+Group=@USBIP_CLIENT_GROUP@
+SupplementaryGroups=usbip
+UMask=0077
+ExecStart=/usr/libexec/usbip-client/usbip-linux-client --serve-fabric-control
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=30s
+StateDirectory=usbip/client
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+BindReadOnlyPaths=/dev/bus/usb
+ProtectHome=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+DevicePolicy=closed
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/usbip/client
+ReadOnlyPaths=/run/usbip-vhci-helper /run/usbip-source-helper /etc/usbip-vhci-helper /etc/usbip
+
+[Install]
+WantedBy=multi-user.target
