@@ -1,0 +1,471 @@
+#!/bin/sh
+set -eu
+
+master=${USBIP_MASTER_BINARY:-/usr/local/libexec/usbip/usbip-linux-master-inventory}
+usbip=${USBIP_TOOL:-/usr/sbin/usbip}
+usbipd=${USBIP_DAEMON:-}
+state_root=${USBIP_MASTER_PORT_STATE_ROOT:-/var/lib/usbip-source/ports}
+sysfs_root=${USBIP_SYSFS_ROOT:-/sys/bus/usb/devices}
+block_sysfs_root=${USBIP_BLOCK_SYSFS_ROOT:-/sys/class/block}
+runtime_root=${USBIP_SOURCE_RUNTIME_ROOT:-/run/usbip-source}
+usbipd_owner=$runtime_root/usbipd-owner.v1
+source_ready=$runtime_root/source-ready.v1
+mode=${1:-}
+port=${2:-}
+allow_storage=${3:-}
+
+usage() {
+  echo 'usage: usbip-linux-master-port-control list | watch | enable PORT [--allow-storage] | disable PORT | reconcile | reconcile-watch | unexport-all' >&2
+  exit 2
+}
+
+valid_port_name() {
+  case "$1" in
+    ''|*[!0-9.-]*|*-|.*|*..*|*:*|usb*) return 1 ;;
+    *-*) ;;
+    *) return 1 ;;
+  esac
+}
+
+valid_port() {
+  valid_port_name "$1" || return 1
+  [ -e "$sysfs_root/$1" ] && [ ! -e "$sysfs_root/$1:$1" ]
+}
+
+read_hex() {
+  value=$(cat -- "$1" 2>/dev/null || true)
+  [ -n "$value" ] || value=00
+  printf '%s' "$value"
+}
+
+is_storage() {
+  [ "$(read_hex "$sysfs_root/$port/bDeviceClass")" = 08 ] && return 0
+  for interface in "$sysfs_root"/"$port":*/bInterfaceClass; do
+    [ -f "$interface" ] || continue
+    [ "$(read_hex "$interface")" = 08 ] && return 0
+  done
+  return 1
+}
+
+is_hub() {
+  [ "$(read_hex "$sysfs_root/$port/bDeviceClass")" = 09 ] && return 0
+  for interface in "$sysfs_root"/"$port":*/bInterfaceClass; do
+    [ -f "$interface" ] || continue
+    [ "$(read_hex "$interface")" = 09 ] && return 0
+  done
+  return 1
+}
+
+device_identity() {
+  identity_serial=$(cat "$sysfs_root/$port/serial" 2>/dev/null || true)
+  [ -n "$identity_serial" ] || return 1
+  {
+    printf 'vid=%s\n' "$(read_hex "$sysfs_root/$port/idVendor")"
+    printf 'pid=%s\n' "$(read_hex "$sysfs_root/$port/idProduct")"
+    printf 'bcd_device=%s\n' "$(read_hex "$sysfs_root/$port/bcdDevice")"
+    printf 'serial=%s\n' "$identity_serial"
+  } | sha256sum | awk '{print $1}'
+}
+
+validate_storage_export() {
+  storage_found=0
+  for block_path in "$block_sysfs_root"/*; do
+    [ -e "$block_path" ] || continue
+    resolved_block=$(readlink -f -- "$block_path" 2>/dev/null || true)
+    case "$resolved_block" in
+      *"/$port/"*|*"/$port:"*) ;;
+      *) continue ;;
+    esac
+    storage_found=1
+    block=$(basename -- "$block_path")
+    if lsblk -nrpo MOUNTPOINT "/dev/$block" 2>/dev/null | grep -q '[^[:space:]]'; then
+      echo "Refusing mounted storage on Master port $port ($block)." >&2
+      return 1
+    fi
+    for storage_node in $(lsblk -nrpo NAME "/dev/$block" 2>/dev/null || true); do
+      if swapon --noheadings --raw --show=NAME 2>/dev/null | grep -Fxq "$storage_node"; then
+        echo "Refusing swap-backed storage on Master port $port ($storage_node)." >&2
+        return 1
+      fi
+      storage_name=${storage_node##*/}
+      if [ -d "$block_sysfs_root/$storage_name/holders" ] \
+        && find "$block_sysfs_root/$storage_name/holders" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+        echo "Refusing storage with active holders on Master port $port ($storage_name)." >&2
+        return 1
+      fi
+    done
+  done
+  if [ "$storage_found" -eq 0 ] && [ "${policy_driver:-}" = usbip-host ]; then
+    # An exactly identity-matched device already owned by usbip-host has no
+    # local block device left to mount, swap, or hold.
+    return 0
+  fi
+  [ "$storage_found" -eq 1 ] || {
+    echo "Refusing storage whose local block-device state cannot be proved on Master port $port." >&2
+    return 1
+  }
+}
+
+ensure_usbipd() {
+  if ss -lntH '( sport = :3240 )' 2>/dev/null | grep -q .; then
+    return 0
+  fi
+  if systemctl cat usbipd.service >/dev/null 2>&1; then
+    if ! systemctl is-active --quiet usbipd.service; then
+      install -d -o root -g root -m 0700 -- "$runtime_root"
+      printf '%s\n' service > "$usbipd_owner"
+      chmod 0600 "$usbipd_owner"
+      if ! systemctl start usbipd.service; then
+        rm -f -- "$usbipd_owner"
+        return 1
+      fi
+    fi
+  else
+    [ -x "$usbipd" ] || { echo 'The USB/IP daemon is not installed.' >&2; return 1; }
+    install -d -o root -g root -m 0700 -- "$runtime_root"
+    printf '%s\n' process=starting > "$usbipd_owner"
+    chmod 0600 "$usbipd_owner"
+    "$usbipd" -4 &
+    usbipd_pid=$!
+    printf 'process=%s\n' "$usbipd_pid" > "$usbipd_owner"
+    chmod 0600 "$usbipd_owner"
+  fi
+  attempt=0
+  while [ "$attempt" -lt 20 ]; do
+    if ss -lntH '( sport = :3240 )' 2>/dev/null | grep -q .; then
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.1
+  done
+  echo 'The USB/IP daemon did not open port 3240.' >&2
+  stop_owned_usbipd || true
+  return 1
+}
+
+stop_owned_usbipd() {
+  [ -f "$usbipd_owner" ] && [ ! -L "$usbipd_owner" ] || return 0
+  usbipd_ownership=$(cat "$usbipd_owner" 2>/dev/null || true)
+  case "$usbipd_ownership" in
+    service)
+      systemctl stop usbipd.service || return 1
+      ;;
+    process=starting) ;;
+    process=*)
+      usbipd_pid=${usbipd_ownership#process=}
+      case "$usbipd_pid" in ''|*[!0-9]*) return 1 ;; esac
+      if kill -0 "$usbipd_pid" 2>/dev/null; then
+        kill "$usbipd_pid" 2>/dev/null || return 1
+        stop_attempt=0
+        while kill -0 "$usbipd_pid" 2>/dev/null && [ "$stop_attempt" -lt 20 ]; do
+          stop_attempt=$((stop_attempt + 1))
+          sleep 0.1
+        done
+        if kill -0 "$usbipd_pid" 2>/dev/null; then
+          kill -KILL "$usbipd_pid" 2>/dev/null || return 1
+          sleep 0.1
+          kill -0 "$usbipd_pid" 2>/dev/null && return 1
+        fi
+      fi
+      ;;
+    *) return 1 ;;
+  esac
+  rm -f -- "$usbipd_owner"
+}
+
+ensure_state_root() {
+  [ "$(id -u)" -eq 0 ] || { echo 'USB port policy requires root.' >&2; exit 1; }
+  if [ ! -e "$state_root" ]; then
+    install -d -o root -g root -m 0700 -- "$state_root"
+  fi
+  [ -d "$state_root" ] && [ ! -L "$state_root" ] || {
+    echo 'The USB port policy directory is unsafe.' >&2
+    exit 1
+  }
+  [ "$(stat -c '%u:%g:%a' -- "$state_root")" = 0:0:700 ] || {
+    echo 'The USB port policy directory has unsafe ownership or mode.' >&2
+    exit 1
+  }
+}
+
+policy_path() {
+  printf '%s/%s.policy' "$state_root" "$1"
+}
+
+write_policy() {
+  policy_state=$1
+  policy_allow_storage=$2
+  ensure_state_root
+  valid_port_name "$port" || usage
+  policy_vid=unknown
+  policy_pid=unknown
+  policy_identity=unproven
+  if [ -e "$sysfs_root/$port" ]; then
+    policy_vid=$(read_hex "$sysfs_root/$port/idVendor")
+    policy_pid=$(read_hex "$sysfs_root/$port/idProduct")
+    policy_identity=$(device_identity 2>/dev/null || printf unproven)
+  fi
+  policy_file=$(policy_path "$port")
+  policy_temp="$state_root/.$port.$$.tmp"
+  umask 077
+  trap 'rm -f -- "$policy_temp"' EXIT HUP INT TERM
+  {
+    printf 'version=2\n'
+    printf 'port=%s\n' "$port"
+    printf 'state=%s\n' "$policy_state"
+    printf 'allow_storage=%s\n' "$policy_allow_storage"
+    printf 'vid=%s\n' "$policy_vid"
+    printf 'pid=%s\n' "$policy_pid"
+    printf 'identity_sha256=%s\n' "$policy_identity"
+  } >"$policy_temp"
+  chmod 0600 -- "$policy_temp"
+  mv -f -- "$policy_temp" "$policy_file"
+  sync -f "$state_root" 2>/dev/null || sync
+  trap - EXIT HUP INT TERM
+}
+
+read_policy_value() {
+  policy_key=$1
+  policy_source=$2
+  sed -n "s/^$policy_key=//p" "$policy_source"
+}
+
+reconcile_policy() {
+  policy_file=$1
+  [ -f "$policy_file" ] && [ ! -L "$policy_file" ] || return 0
+  [ "$(stat -c '%u:%g:%a' -- "$policy_file")" = 0:0:600 ] || {
+    echo "Ignoring unsafe USB port policy $policy_file." >&2
+    return 0
+  }
+  policy_version=$(read_policy_value version "$policy_file")
+  policy_port=$(read_policy_value port "$policy_file")
+  policy_state=$(read_policy_value state "$policy_file")
+  policy_allow_storage=$(read_policy_value allow_storage "$policy_file")
+  policy_vid=$(read_policy_value vid "$policy_file")
+  policy_pid=$(read_policy_value pid "$policy_file")
+  policy_identity=$(read_policy_value identity_sha256 "$policy_file")
+  [ "$policy_version" = 2 ] && valid_port_name "$policy_port" || {
+    echo "Ignoring malformed USB port policy $policy_file." >&2
+    return 0
+  }
+  case "$policy_state:$policy_allow_storage" in
+    enabled:0|enabled:1|disabled:0|disabled:1) ;;
+    *) echo "Ignoring malformed USB port policy $policy_file." >&2; return 0 ;;
+  esac
+
+  policy_driver=$(readlink "$sysfs_root/$policy_port/driver" 2>/dev/null || true)
+  policy_driver=${policy_driver##*/}
+  if [ "$policy_state" = disabled ]; then
+    if [ "$policy_driver" = usbip-host ]; then
+      if ! "$usbip" unbind -b "$policy_port"; then
+        echo "USBIP_MASTER_PORT_UNEXPORT_FAILED port=$policy_port" >&2
+        return 1
+      fi
+      echo "USBIP_MASTER_PORT_RECONCILED port=$policy_port state=disabled"
+    fi
+    return 0
+  fi
+
+  [ -e "$sysfs_root/$policy_port" ] || return 0
+  current_vid=$(read_hex "$sysfs_root/$policy_port/idVendor")
+  current_pid=$(read_hex "$sysfs_root/$policy_port/idProduct")
+  if [ "$policy_vid" != "$current_vid" ] || [ "$policy_pid" != "$current_pid" ]; then
+    if [ "$policy_driver" = usbip-host ] && ! "$usbip" unbind -b "$policy_port"; then
+      return 1
+    fi
+    port=$policy_port
+    write_policy disabled 0
+    echo "USBIP_MASTER_PORT_IDENTITY_CHANGED port=$policy_port state=disabled" >&2
+    return 0
+  fi
+  port=$policy_port
+  if is_hub; then
+    if [ "$policy_driver" = usbip-host ]; then
+      "$usbip" unbind -b "$policy_port" || return 1
+    fi
+    write_policy disabled 0
+    echo "USBIP_MASTER_PORT_BLOCKED port=$policy_port reason=hub" >&2
+    return 0
+  fi
+  if is_storage; then
+    current_identity=$(device_identity 2>/dev/null || printf unproven)
+    if [ "$policy_allow_storage" != 1 ] \
+      || [ "$policy_identity" = unproven ] \
+      || [ "$current_identity" = unproven ] \
+      || [ "$policy_identity" != "$current_identity" ]; then
+      if [ "$policy_driver" = usbip-host ]; then
+        "$usbip" unbind -b "$policy_port" || return 1
+      fi
+      write_policy disabled 0
+      echo "USBIP_MASTER_PORT_STORAGE_BLOCKED port=$policy_port reason=approval-or-identity" >&2
+      return 0
+    fi
+    validate_storage_export || {
+      if [ "$policy_driver" = usbip-host ]; then
+        "$usbip" unbind -b "$policy_port" || return 1
+      fi
+      echo "USBIP_MASTER_PORT_STORAGE_BLOCKED port=$policy_port reason=host-in-use" >&2
+      return 1
+    }
+  fi
+  [ "$policy_driver" = usbip-host ] && return 0
+  if ! modprobe usbip-host; then
+    echo "USBIP_MASTER_PORT_BIND_FAILED port=$policy_port reason=module" >&2
+    return 1
+  fi
+  if ! ensure_usbipd; then
+    echo "USBIP_MASTER_PORT_BIND_FAILED port=$policy_port reason=daemon" >&2
+    return 1
+  fi
+  if ! "$usbip" bind -b "$policy_port"; then
+    echo "USBIP_MASTER_PORT_BIND_FAILED port=$policy_port reason=bind" >&2
+    stop_owned_usbipd || true
+    return 1
+  fi
+  echo "USBIP_MASTER_PORT_RECONCILED port=$policy_port state=enabled"
+}
+
+discover_default_policies() {
+  ensure_state_root
+  for vendor_path in "$sysfs_root"/*/idVendor; do
+    [ -f "$vendor_path" ] || continue
+    discovered_port=${vendor_path%/idVendor}
+    discovered_port=${discovered_port##*/}
+    valid_port_name "$discovered_port" || continue
+    [ -f "$sysfs_root/$discovered_port/idProduct" ] || continue
+    port=$discovered_port
+    is_hub && continue
+
+    discovered_vid=$(read_hex "$sysfs_root/$port/idVendor")
+    discovered_pid=$(read_hex "$sysfs_root/$port/idProduct")
+    discovered_identity=$(device_identity 2>/dev/null || printf unproven)
+    discovered_policy=$(policy_path "$port")
+    if [ -f "$discovered_policy" ] && [ ! -L "$discovered_policy" ] \
+      && [ "$(stat -c '%u:%g:%a' -- "$discovered_policy")" = 0:0:600 ] \
+      && [ "$(read_policy_value version "$discovered_policy")" = 2 ] \
+      && [ "$(read_policy_value port "$discovered_policy")" = "$port" ] \
+      && [ "$(read_policy_value vid "$discovered_policy")" = "$discovered_vid" ] \
+      && [ "$(read_policy_value pid "$discovered_policy")" = "$discovered_pid" ]; then
+      if ! is_storage \
+        || { [ "$discovered_identity" != unproven ] \
+          && [ "$(read_policy_value identity_sha256 "$discovered_policy")" = "$discovered_identity" ]; }; then
+        continue
+      fi
+    fi
+
+    write_policy disabled 0
+    if is_storage; then discovery_storage=1; else discovery_storage=0; fi
+    echo "USBIP_MASTER_PORT_DISCOVERED port=$port state=disabled storage=$discovery_storage"
+  done
+}
+
+reconcile_all() {
+  ensure_state_root
+  discover_default_policies
+  reconcile_failed=0
+  for policy_file in "$state_root"/*.policy; do
+    [ -e "$policy_file" ] || continue
+    if ! reconcile_policy "$policy_file"; then
+      echo "USBIP_MASTER_PORT_RECONCILE_FAILED policy=$policy_file" >&2
+      reconcile_failed=1
+    fi
+  done
+  return "$reconcile_failed"
+}
+
+unexport_all() {
+  rm -f -- "$source_ready"
+  ensure_state_root
+  unexport_failed=0
+  for policy_file in "$state_root"/*.policy; do
+    [ -f "$policy_file" ] && [ ! -L "$policy_file" ] || continue
+    policy_port=$(read_policy_value port "$policy_file")
+    valid_port_name "$policy_port" || continue
+    policy_driver=$(readlink "$sysfs_root/$policy_port/driver" 2>/dev/null || true)
+    [ "${policy_driver##*/}" = usbip-host ] || continue
+    if "$usbip" unbind -b "$policy_port"; then
+      echo "USBIP_MASTER_PORT_UNEXPORTED port=$policy_port"
+    else
+      echo "USBIP_MASTER_PORT_UNEXPORT_FAILED port=$policy_port" >&2
+      unexport_failed=1
+    fi
+  done
+  if ! stop_owned_usbipd; then
+    echo 'USBIP_MASTER_USBIPD_STOP_FAILED' >&2
+    unexport_failed=1
+  fi
+  return "$unexport_failed"
+}
+
+case "$mode" in
+  list)
+    [ "$#" -eq 1 ] || usage
+    if [ -x "$master" ]; then
+      exec "$master" --list
+    fi
+    exec "$usbip" list -l
+    ;;
+  watch)
+    [ "$#" -eq 1 ] || usage
+    if [ -x "$master" ]; then
+      exec "$master" --watch
+    fi
+    while :; do
+      "$usbip" list -l
+      sleep 1
+    done
+    ;;
+  enable)
+    [ "$#" -eq 2 ] || [ "$#" -eq 3 ] || usage
+    valid_port "$port" || { echo 'The selected Master USB port is unavailable.' >&2; exit 1; }
+    [ "$(id -u)" -eq 0 ] || { echo 'Enabling a Master USB port requires root.' >&2; exit 1; }
+    is_hub && { echo 'USB hubs cannot be exported.' >&2; exit 1; }
+    if is_storage; then
+      [ "$allow_storage" = --allow-storage ] || {
+        echo 'Storage sharing is off by default. Use --allow-storage only after confirming the exact device.' >&2
+        exit 1
+      }
+      device_identity >/dev/null 2>&1 || {
+        echo 'Storage sharing requires a stable device serial identity.' >&2
+        exit 1
+      }
+      validate_storage_export
+    else
+      [ -z "$allow_storage" ] || usage
+    fi
+    policy_storage=0
+    [ "$allow_storage" = --allow-storage ] && policy_storage=1
+    write_policy enabled "$policy_storage"
+    reconcile_policy "$(policy_path "$port")"
+    echo "USBIP_MASTER_PORT_ENABLED port=$port"
+    ;;
+  disable)
+    [ "$#" -eq 2 ] || usage
+    valid_port_name "$port" || usage
+    [ "$(id -u)" -eq 0 ] || { echo 'Disabling a Master USB port requires root.' >&2; exit 1; }
+    write_policy disabled 0
+    reconcile_policy "$(policy_path "$port")"
+    echo "USBIP_MASTER_PORT_DISABLED port=$port"
+    ;;
+  reconcile)
+    [ "$#" -eq 1 ] || usage
+    reconcile_all
+    ;;
+  reconcile-watch)
+    [ "$#" -eq 1 ] || usage
+    rm -f -- "$source_ready"
+    reconcile_all
+    install -d -o root -g root -m 0700 -- "$runtime_root"
+    printf '%s\n' USBIP_SOURCE_READY_V1 > "$source_ready"
+    chmod 0600 "$source_ready"
+    while :; do
+      sleep 1
+      reconcile_all
+    done
+    ;;
+  unexport-all)
+    [ "$#" -eq 1 ] || usage
+    unexport_all
+    ;;
+  *) usage ;;
+esac

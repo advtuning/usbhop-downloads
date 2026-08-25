@@ -1,0 +1,37 @@
+[Unit]
+Description=USB HOP Linux Client upstream USB source watcher
+After=local-fs.target network-online.target
+Before=usbip-linux-client.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=root
+Group=root
+UMask=0077
+Environment="USBIP_DAEMON=@USBIP_DAEMON@"
+ExecStart=/usr/libexec/usbip-client/usbip-linux-source-port-control reconcile-watch
+ExecStopPost=/usr/libexec/usbip-client/usbip-linux-source-port-control unexport-all
+Restart=no
+KillMode=control-group
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=no
+StateDirectory=usbip-source
+StateDirectoryMode=0700
+RuntimeDirectory=usbip-source
+RuntimeDirectoryMode=0700
+ProtectSystem=full
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/usbip-source
+
+[Install]
+WantedBy=multi-user.target
