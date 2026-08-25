@@ -12,12 +12,14 @@ helper_path=$package_root/usbip-linux-vhci-helper
 source_helper_path=$package_root/usbip-linux-client-source-helper
 source_provision_path=$package_root/usbip-linux-client-source-provision
 source_worker_path=$package_root/usbip-linux-master-usb-worker
+source_control_path=$package_root/usbip-linux-source-port-control
 authority_tool_path=$package_root/usbip-linux-authority
 pairing_tool_path=$package_root/usbip-linux-pairing
 entry_path=/usr/bin/usbip-client
 service_path=/etc/systemd/system/usbip-linux-client-vhci.service
 agent_service_path=/etc/systemd/system/usbip-linux-client.service
 source_service_path=/etc/systemd/system/usbip-linux-client-source-helper.service
+source_watch_service_path=/etc/systemd/system/usbip-linux-client-source-watch.service
 source_peer_policy=/etc/usbip/client-source-helper-peer.v1
 source_public_key=/etc/usbip/client-source-helper-public-key.ed25519
 source_digest=/etc/usbip/client-source-helper-executable.sha256.bin
@@ -114,9 +116,11 @@ payload/usbip-linux-client.service
 payload/usbip-linux-client-source-helper
 payload/usbip-linux-client-source-helper.service
 payload/usbip-linux-client-source-provision
+payload/usbip-linux-client-source-watch.service
 payload/usbip-linux-client-vhci.service
 payload/usbip-linux-master-usb-worker
 payload/usbip-linux-pairing
+payload/usbip-linux-source-port-control
 payload/usbip-linux-vhci-helper'
   actual=$(awk '{print $2}' "$manifest")
   [ "$actual" = "$expected" ] || { echo "Unexpected bundle manifest." >&2; exit 1; }
@@ -132,7 +136,7 @@ payload/usbip-linux-vhci-helper'
     exit 1
   }
   (cd "$root" && sha256sum -c SHA256SUMS >/dev/null)
-  [ "$(wc -l < "$metadata")" -eq 21 ] || { echo "Invalid build metadata." >&2; exit 1; }
+  [ "$(wc -l < "$metadata")" -eq 23 ] || { echo "Invalid build metadata." >&2; exit 1; }
   [ "$(sed -n '1p' "$metadata")" = USBIP_LINUX_CLIENT_PRODUCT_BUILD_V1 ] || {
     echo "Invalid product build metadata." >&2
     exit 1
@@ -144,7 +148,7 @@ payload/usbip-linux-vhci-helper'
     aarch64-unknown-linux-musl:aarch64:aarch64|aarch64-unknown-linux-musl:aarch64:arm64) ;;
     *) echo "Bundle target does not match this Linux host." >&2; exit 1 ;;
   esac
-  for name in client helper authority pairing service agent_service source_helper source_provision source_worker source_service installer source_manifest cargo_lock; do
+  for name in client helper authority pairing service agent_service source_helper source_provision source_worker source_service source_watch_service source_control installer source_manifest cargo_lock; do
     value=$(metadata_value "${name}_sha256") || exit 1
     valid_hash "$value" || { echo "Invalid bundle hash metadata." >&2; exit 1; }
   done
@@ -158,6 +162,8 @@ payload/usbip-linux-vhci-helper'
   [ "$(sha256sum "$payload/usbip-linux-client-source-provision" | awk '{print $1}')" = "$(metadata_value source_provision_sha256)" ] || exit 1
   [ "$(sha256sum "$payload/usbip-linux-master-usb-worker" | awk '{print $1}')" = "$(metadata_value source_worker_sha256)" ] || exit 1
   [ "$(sha256sum "$payload/usbip-linux-client-source-helper.service" | awk '{print $1}')" = "$(metadata_value source_service_sha256)" ] || exit 1
+  [ "$(sha256sum "$payload/usbip-linux-client-source-watch.service" | awk '{print $1}')" = "$(metadata_value source_watch_service_sha256)" ] || exit 1
+  [ "$(sha256sum "$payload/usbip-linux-source-port-control" | awk '{print $1}')" = "$(metadata_value source_control_sha256)" ] || exit 1
   [ "$(sha256sum "$root/install-usbip-linux-client.sh" | awk '{print $1}')" = "$(metadata_value installer_sha256)" ] || exit 1
   [ "$(sha256sum "$root/SOURCE-MANIFEST.v1" | awk '{print $1}')" = "$(metadata_value source_manifest_sha256)" ] || exit 1
   [ "$(metadata_value rustflags)" = '-C_relocation-model=static' ] || exit 1
@@ -236,6 +242,29 @@ find_package_owned_usbip() {
   return 1
 }
 
+valid_usbipd_path() {
+  candidate=$1
+  case "$candidate" in /*) ;; *) return 1 ;; esac
+  case "$candidate" in *[!A-Za-z0-9_./+-]*) return 1 ;; esac
+  resolved=$(readlink -f -- "$candidate" 2>/dev/null || true)
+  [ "$resolved" = "$candidate" ] && [ -f "$resolved" ] && [ ! -L "$resolved" ] && [ -x "$resolved" ] || return 1
+  [ "$(stat -c '%a:%u:%g' "$resolved" 2>/dev/null || true)" = 755:0:0 ] || return 1
+  package_file_is_owned "$resolved"
+}
+
+find_package_owned_usbipd() {
+  candidates="/usr/sbin/usbipd /usr/lib/linux-tools/$(uname -r)/usbipd"
+  discovered=$(command -v usbipd 2>/dev/null || true)
+  case "$discovered" in /*) candidates="$candidates $discovered" ;; esac
+  for candidate in $candidates; do
+    resolved=$(readlink -f -- "$candidate" 2>/dev/null || true)
+    valid_usbipd_path "$resolved" || continue
+    printf '%s\n' "$resolved"
+    return 0
+  done
+  return 1
+}
+
 unified_cgroup_v2_gate() {
   [ -r /sys/fs/cgroup/cgroup.controllers ] || {
     echo "Unified cgroup v2 is required for safe USB worker restart recovery." >&2
@@ -257,6 +286,9 @@ host_gate() {
   [ "$(uname -s 2>/dev/null || true)" = Linux ] || { echo "Linux host required." >&2; exit 1; }
   [ -d /run/systemd/system ] || { echo "systemd must be enabled for the Linux Client helper." >&2; exit 1; }
   command -v systemctl >/dev/null 2>&1 || { echo "systemctl is required for the Linux Client helper." >&2; exit 1; }
+  for command in find lsblk modinfo readlink sha256sum ss stat swapon; do require_command "$command"; done
+  command -v modprobe >/dev/null 2>&1 || { echo "modprobe is required for upstream USB source sharing." >&2; exit 1; }
+  modinfo usbip_host >/dev/null 2>&1 || { echo "The running kernel has no upstream usbip-host source module." >&2; exit 1; }
   unified_cgroup_v2_gate || exit 1
   if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then
     grep -qi microsoft-standard-WSL2 /proc/sys/kernel/osrelease || {
@@ -274,6 +306,10 @@ host_gate() {
   }
   find_package_owned_usbip >/dev/null || {
     echo "A root-owned, package-owned usbip tool is required; installer will not mutate packages." >&2
+    exit 1
+  }
+  find_package_owned_usbipd >/dev/null || {
+    echo "A root-owned, package-owned usbipd daemon is required for source sharing." >&2
     exit 1
   }
   peer_pidfd_gate
@@ -316,7 +352,36 @@ render_agent_service() {
   mv -T -- "$temporary" "$destination_unit"
 }
 
-# The privileged VHCI helper unit pins ReadOnlyPaths=/run/vhci_hcd. When that
+render_source_watch_service() {
+  source_unit=$1
+  destination_unit=$2
+  daemon_path=$3
+  valid_usbipd_path "$daemon_path" || return 1
+  [ "$(grep -c '@USBIP_DAEMON@' "$source_unit")" -eq 1 ] || return 1
+  temporary=$destination_unit.new
+  sed "s|@USBIP_DAEMON@|$daemon_path|" "$source_unit" > "$temporary"
+  chown root:root "$temporary"
+  chmod 0644 "$temporary"
+  mv -T -- "$temporary" "$destination_unit"
+}
+
+verify_rendered_source_watch_service() {
+  installed_unit=$1
+  source_unit=$2
+  [ -f "$installed_unit" ] && [ ! -L "$installed_unit" ] || return 1
+  [ "$(stat -c '%a:%u:%g:%h' "$installed_unit")" = 644:0:0:1 ] || return 1
+  daemon_path=$(sed -n 's/^Environment="USBIP_DAEMON=\([^\"]*\)"$/\1/p' "$installed_unit")
+  [ "$(grep -c '^Environment="USBIP_DAEMON=' "$installed_unit")" -eq 1 ] || return 1
+  valid_usbipd_path "$daemon_path" || return 1
+  expected_unit=$(mktemp) || return 1
+  sed "s|@USBIP_DAEMON@|$daemon_path|" "$source_unit" > "$expected_unit"
+  cmp -s -- "$expected_unit" "$installed_unit"
+  verified=$?
+  rm -f -- "$expected_unit"
+  return "$verified"
+}
+
+# The privileged VHCI helper unit grants write access only to /run/vhci_hcd. When that
 # directory is absent the unit fails with status=226/NAMESPACE, so the product
 # owns a tmpfiles.d rule that recreates it at every boot, and materialises the
 # directory immediately so the first start succeeds without a reboot.
@@ -371,16 +436,20 @@ migrate_legacy_state() {
 stage_upgrade_payload() {
   service_user=$1
   service_gid=$2
+  daemon_path=$3
   [ ! -e "$prepared_stage" ] && [ ! -L "$prepared_stage" ] || return 1
   install -d -o root -g root -m 0700 "$prepared_stage"
   for name in usbip-linux-client usbip-linux-vhci-helper usbip-linux-authority usbip-linux-pairing \
-    usbip-linux-client-source-helper usbip-linux-client-source-provision usbip-linux-master-usb-worker; do
+    usbip-linux-client-source-helper usbip-linux-client-source-provision usbip-linux-master-usb-worker \
+    usbip-linux-source-port-control; do
     install -o root -g root -m 0755 "$payload/$name" "$prepared_stage/$name"
   done
   install -o root -g root -m 0644 "$payload/usbip-linux-client-vhci.service" \
     "$prepared_stage/usbip-linux-client-vhci.service"
   install -o root -g root -m 0644 "$payload/usbip-linux-client-source-helper.service" \
     "$prepared_stage/usbip-linux-client-source-helper.service"
+  render_source_watch_service "$payload/usbip-linux-client-source-watch.service" \
+    "$prepared_stage/usbip-linux-client-source-watch.service" "$daemon_path"
   render_agent_service "$payload/usbip-linux-client.service" \
     "$prepared_stage/usbip-linux-client.service" "$service_user" "$service_gid"
   (cd "$prepared_stage" && sha256sum -- * > STAGED.sha256)
@@ -400,6 +469,7 @@ discard_prepared_stage() {
     usbip-linux-authority usbip-linux-pairing usbip-linux-client-source-helper \
     usbip-linux-client-source-provision usbip-linux-master-usb-worker \
     usbip-linux-client-source-helper.service usbip-linux-client-vhci.service \
+    usbip-linux-client-source-watch.service usbip-linux-source-port-control \
     usbip-linux-client.service; do
     rm -f -- "$prepared_stage/$name"
   done
@@ -417,18 +487,28 @@ load_install_record() {
       installed_state_root=$legacy_state_root
       agent_service_recorded=0
       source_helper_recorded=0
+      source_watch_recorded=0
       ;;
     USBIP_LINUX_CLIENT_INSTALL_V2:25)
       installed_state_root=$(record_value state_root) || exit 1
       [ "$installed_state_root" = "$state_root" ] || exit 1
       agent_service_recorded=1
       source_helper_recorded=0
+      source_watch_recorded=0
       ;;
     USBIP_LINUX_CLIENT_INSTALL_V3:33)
       installed_state_root=$(record_value state_root) || exit 1
       [ "$installed_state_root" = "$state_root" ] || exit 1
       agent_service_recorded=1
       source_helper_recorded=1
+      source_watch_recorded=0
+      ;;
+    USBIP_LINUX_CLIENT_INSTALL_V4:35)
+      installed_state_root=$(record_value state_root) || exit 1
+      [ "$installed_state_root" = "$state_root" ] || exit 1
+      agent_service_recorded=1
+      source_helper_recorded=1
+      source_watch_recorded=1
       ;;
     *) echo "Install ownership journal version or shape changed." >&2; exit 1 ;;
   esac
@@ -485,6 +565,10 @@ verify_installed() {
     verify_regular "$source_digest" "$(record_value source_digest_sha256)" 644 0 0 || exit 1
     verify_regular "$source_signing_key" "$(record_value source_signing_key_sha256)" 600 0 0 || exit 1
   fi
+  if [ "$source_watch_recorded" -eq 1 ]; then
+    verify_regular "$source_control_path" "$(record_value source_control_sha256)" 755 0 0 || exit 1
+    verify_regular "$source_watch_service_path" "$(record_value source_watch_service_sha256)" 644 0 0 || exit 1
+  fi
   verify_regular "$authority_path" "$(record_value authority_record_sha256)" 640 0 0 || exit 1
   verify_regular "$modules_path" "$(record_value modules_sha256)" 644 0 0 || exit 1
   verify_regular /usr/sbin/usbip "$(record_value usbip_sha256)" 755 0 0 || exit 1
@@ -535,7 +619,7 @@ write_install_record() {
   vhci_flag=$1 usbip_flag=$2 packages=$3 package_versions=$4
   temporary=$(mktemp "$package_state/.install.v1.XXXXXX")
   printf '%s\n' \
-    USBIP_LINUX_CLIENT_INSTALL_V3 \
+    USBIP_LINUX_CLIENT_INSTALL_V4 \
     "target=$target_value" \
     "client_user=$user" \
     "client_uid=$uid" \
@@ -558,6 +642,8 @@ write_install_record() {
     "source_provision_sha256=$(sha256sum "$source_provision_path" | awk '{print $1}')" \
     "source_worker_sha256=$(sha256sum "$source_worker_path" | awk '{print $1}')" \
     "source_service_sha256=$(sha256sum "$source_service_path" | awk '{print $1}')" \
+    "source_control_sha256=$(sha256sum "$source_control_path" | awk '{print $1}')" \
+    "source_watch_service_sha256=$(sha256sum "$source_watch_service_path" | awk '{print $1}')" \
     "source_peer_policy_sha256=$(sha256sum "$source_peer_policy" | awk '{print $1}')" \
     "source_public_key_sha256=$(sha256sum "$source_public_key" | awk '{print $1}')" \
     "source_digest_sha256=$(sha256sum "$source_digest" | awk '{print $1}')" \
@@ -583,6 +669,12 @@ stop_and_quiesce() {
     systemctl stop usbip-linux-client.service || return 1
   fi
   [ "$(systemctl is-active usbip-linux-client.service 2>/dev/null || true)" != active ] || return 1
+  if [ "${source_watch_recorded:-0}" -eq 1 ]; then
+    record_lifecycle_phase source-watch-stopping
+    systemctl stop usbip-linux-client-source-watch.service || return 1
+    [ "$(systemctl is-active usbip-linux-client-source-watch.service 2>/dev/null || true)" = inactive ] || return 1
+    [ ! -e /run/usbip-source/source-ready.v1 ] || return 1
+  fi
   if [ "${source_helper_recorded:-0}" -eq 1 ]; then
     record_lifecycle_phase source-helper-stopping
     systemctl stop usbip-linux-client-source-helper.service || return 1
@@ -597,7 +689,7 @@ stop_and_quiesce() {
   systemctl stop usbip-linux-client-vhci.service || return 1
   [ "$(systemctl is-active usbip-linux-client-vhci.service 2>/dev/null || true)" = inactive ] || return 1
   [ ! -e /run/usbip-vhci-helper/control.sock ] || return 1
-  # `/run/vhci_hcd` is upstream global state and is inspected read-only.
+  # `/run/vhci_hcd` contains the helper-owned upstream per-port records.
   [ ! -e /var/lib/usbip-vhci-helper/ownership.v1 ] || return 1
   [ ! -e /var/lib/usbip-vhci-helper/ownership.v2 ] || return 1
 }
@@ -611,6 +703,11 @@ start_service_set() {
     systemctl start usbip-linux-client-source-helper.service
     wait_source_helper_ready || return 1
   fi
+  if [ "${source_watch_recorded:-1}" -eq 1 ]; then
+    record_lifecycle_phase source-watch-starting
+    systemctl start usbip-linux-client-source-watch.service
+    wait_source_watch_ready || return 1
+  fi
   if [ -n "$(find "$state_root/identity" -mindepth 1 -maxdepth 1 -type f -print -quit)" ]; then
     record_lifecycle_phase agent-starting
     systemctl start usbip-linux-client.service
@@ -618,6 +715,20 @@ start_service_set() {
     record_lifecycle_phase agent-health-checking
     runuser -u "$installed_user" -- "$client_path" --fabric-health-probe
   fi
+}
+
+wait_source_watch_ready() {
+  attempts=0
+  while [ "$attempts" -lt 50 ]; do
+    if systemctl is-active --quiet usbip-linux-client-source-watch.service \
+      && [ "$(cat /run/usbip-source/source-ready.v1 2>/dev/null || true)" = USBIP_SOURCE_READY_V1 ]; then
+      return 0
+    fi
+    systemctl is-active --quiet usbip-linux-client-source-watch.service || return 1
+    sleep 0.1
+    attempts=$((attempts + 1))
+  done
+  return 1
 }
 
 wait_source_helper_ready() {
@@ -725,8 +836,15 @@ create_client_upgrade_backup() {
     cp -p -- "$agent_service_path" "$upgrade_backup/usbip-linux-client.service"
     append_client_backup_entry "$agent_service_path"
   fi
-  printf 'agent_service_present=%s\nsource_helper_present=%s\nstate_root=%s\n' "$agent_service_recorded" \
-    "${source_helper_recorded:-0}" "$installed_state_root" >> "$upgrade_backup/OWNERSHIP.v1"
+  if [ "${source_watch_recorded:-0}" -eq 1 ]; then
+    for original in "$source_control_path" "$source_watch_service_path"; do
+      [ -f "$original" ] && [ ! -L "$original" ] || return 1
+      cp -p -- "$original" "$upgrade_backup/$(basename -- "$original")"
+      append_client_backup_entry "$original"
+    done
+  fi
+  printf 'agent_service_present=%s\nsource_helper_present=%s\nsource_watch_present=%s\nstate_root=%s\n' "$agent_service_recorded" \
+    "${source_helper_recorded:-0}" "${source_watch_recorded:-0}" "$installed_state_root" >> "$upgrade_backup/OWNERSHIP.v1"
   chown root:root "$upgrade_backup/OWNERSHIP.v1"
   chmod 0600 "$upgrade_backup/OWNERSHIP.v1"
   backup_client_database
@@ -744,7 +862,7 @@ validate_client_upgrade_backup() {
     "$(sha256sum "$upgrade_backup/OWNERSHIP.v1" | awk '{print $1}')" 600 0 0 || return 1
   [ "$(sed -n '1p' "$upgrade_backup/OWNERSHIP.v1")" = USBIP_LINUX_CLIENT_OWNERSHIP_V1 ] || return 1
   tail -n +2 "$upgrade_backup/OWNERSHIP.v1" | while IFS='|' read -r original name mode uid gid hash; do
-    case "$original" in agent_service_present=*|source_helper_present=*|state_root=*) continue ;; esac
+    case "$original" in agent_service_present=*|source_helper_present=*|source_watch_present=*|state_root=*) continue ;; esac
     [ "$(basename -- "$original")" = "$name" ] || exit 1
     verify_regular "$upgrade_backup/$name" "$hash" "$mode" "$uid" "$gid" || exit 1
   done
@@ -758,7 +876,7 @@ validate_client_upgrade_backup() {
 
 validate_client_restored_files() {
   tail -n +2 "$upgrade_backup/OWNERSHIP.v1" | while IFS='|' read -r original name mode uid gid hash; do
-    case "$original" in agent_service_present=*|source_helper_present=*|state_root=*) continue ;; esac
+    case "$original" in agent_service_present=*|source_helper_present=*|source_watch_present=*|state_root=*) continue ;; esac
     [ -f "$original" ] && [ ! -L "$original" ] || exit 1
     [ "$(stat -c '%a:%u:%g:%h' "$original")" = "$mode:$uid:$gid:1" ] || exit 1
     [ "$(sha256sum "$original" | awk '{print $1}')" = "$hash" ] || exit 1
@@ -814,6 +932,18 @@ restore_client_upgrade_backup() {
       ;;
     *) return 1 ;;
   esac
+  old_source_watch=$(sed -n 's/^source_watch_present=//p' "$upgrade_backup/OWNERSHIP.v1")
+  case "$old_source_watch" in
+    1)
+      install -o root -g root -m 0755 "$upgrade_backup/usbip-linux-source-port-control" "$source_control_path"
+      install -o root -g root -m 0644 "$upgrade_backup/usbip-linux-client-source-watch.service" "$source_watch_service_path"
+      ;;
+    0)
+      systemctl disable usbip-linux-client-source-watch.service >/dev/null 2>&1 || true
+      rm -f -- "$source_control_path" "$source_watch_service_path"
+      ;;
+    *) return 1 ;;
+  esac
   install -o root -g root -m 0600 "$upgrade_backup/install.v1" "$install_record"
   restore_client_database
   validate_client_restored_files
@@ -823,6 +953,7 @@ clear_upgrade_transaction() {
   for name in usbip-linux-client usbip-linux-vhci-helper usbip-linux-authority usbip-linux-pairing \
     usbip-linux-client-source-helper usbip-linux-client-source-provision usbip-linux-master-usb-worker \
     usbip-linux-client-source-helper.service client-source-helper-peer.v1 \
+    usbip-linux-client-source-watch.service usbip-linux-source-port-control \
     client-source-helper-public-key.ed25519 client-source-helper-executable.sha256.bin \
     broker-signing-key.pk8 usbip-linux-client-vhci.service usbip-linux-client.service install.v1 OWNERSHIP.v1; do
     rm -f -- "$upgrade_backup/$name"
@@ -854,6 +985,8 @@ validate_partial_upgrade_backup() {
       usbip-linux-client-source-provision) verify_regular "$path" "$(record_value source_provision_sha256)" 755 0 0 || return 1 ;;
       usbip-linux-master-usb-worker) verify_regular "$path" "$(record_value source_worker_sha256)" 755 0 0 || return 1 ;;
       usbip-linux-client-source-helper.service) verify_regular "$path" "$(record_value source_service_sha256)" 644 0 0 || return 1 ;;
+      usbip-linux-client-source-watch.service) verify_regular "$path" "$(record_value source_watch_service_sha256)" 644 0 0 || return 1 ;;
+      usbip-linux-source-port-control) verify_regular "$path" "$(record_value source_control_sha256)" 755 0 0 || return 1 ;;
       client-source-helper-peer.v1) verify_regular "$path" "$(record_value source_peer_policy_sha256)" 600 0 0 || return 1 ;;
       client-source-helper-public-key.ed25519) verify_regular "$path" "$(record_value source_public_key_sha256)" 644 0 0 || return 1 ;;
       client-source-helper-executable.sha256.bin) verify_regular "$path" "$(record_value source_digest_sha256)" 644 0 0 || return 1 ;;
@@ -914,16 +1047,18 @@ usbip-linux-client.service
 usbip-linux-client-source-helper
 usbip-linux-client-source-helper.service
 usbip-linux-client-source-provision
+usbip-linux-client-source-watch.service
 usbip-linux-client-vhci.service
 usbip-linux-client.conf
 usbip-linux-master-usb-worker
 usbip-linux-pairing
+usbip-linux-source-port-control
 usbip-linux-vhci-helper'
   actual=$(find "$remove_backup" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)
   [ "$actual" = "$expected" ] || { echo "Removal backup inventory changed." >&2; return 1; }
   [ "$(stat -c '%a:%u:%g' "$remove_backup/install.v1")" = 600:0:0 ] || return 1
-  [ "$(wc -l < "$remove_backup/install.v1")" -eq 33 ] || return 1
-  [ "$(sed -n '1p' "$remove_backup/install.v1")" = USBIP_LINUX_CLIENT_INSTALL_V3 ] || return 1
+  [ "$(wc -l < "$remove_backup/install.v1")" -eq 35 ] || return 1
+  [ "$(sed -n '1p' "$remove_backup/install.v1")" = USBIP_LINUX_CLIENT_INSTALL_V4 ] || return 1
   installed_target=$(remove_backup_value target) || return 1
   installed_user=$(remove_backup_value client_user) || return 1
   installed_uid=$(remove_backup_value client_uid) || return 1
@@ -961,6 +1096,8 @@ usbip-linux-vhci-helper'
   verify_regular "$remove_backup/usbip-linux-client-source-provision" "$(remove_backup_value source_provision_sha256)" 755 0 0 || return 1
   verify_regular "$remove_backup/usbip-linux-master-usb-worker" "$(remove_backup_value source_worker_sha256)" 755 0 0 || return 1
   verify_regular "$remove_backup/usbip-linux-client-source-helper.service" "$(remove_backup_value source_service_sha256)" 644 0 0 || return 1
+  verify_regular "$remove_backup/usbip-linux-client-source-watch.service" "$(remove_backup_value source_watch_service_sha256)" 644 0 0 || return 1
+  verify_regular "$remove_backup/usbip-linux-source-port-control" "$(remove_backup_value source_control_sha256)" 755 0 0 || return 1
   verify_regular "$remove_backup/client-source-helper-peer.v1" "$(remove_backup_value source_peer_policy_sha256)" 600 0 0 || return 1
   verify_regular "$remove_backup/client-source-helper-public-key.ed25519" "$(remove_backup_value source_public_key_sha256)" 644 0 0 || return 1
   verify_regular "$remove_backup/client-source-helper-executable.sha256.bin" "$(remove_backup_value source_digest_sha256)" 644 0 0 || return 1
@@ -988,6 +1125,8 @@ validate_partial_remove_backup() {
       usbip-linux-client-source-provision) verify_regular "$path" "$(record_value source_provision_sha256)" 755 0 0 || return 1 ;;
       usbip-linux-master-usb-worker) verify_regular "$path" "$(record_value source_worker_sha256)" 755 0 0 || return 1 ;;
       usbip-linux-client-source-helper.service) verify_regular "$path" "$(record_value source_service_sha256)" 644 0 0 || return 1 ;;
+      usbip-linux-client-source-watch.service) verify_regular "$path" "$(record_value source_watch_service_sha256)" 644 0 0 || return 1 ;;
+      usbip-linux-source-port-control) verify_regular "$path" "$(record_value source_control_sha256)" 755 0 0 || return 1 ;;
       client-source-helper-peer.v1) verify_regular "$path" "$(record_value source_peer_policy_sha256)" 600 0 0 || return 1 ;;
       client-source-helper-public-key.ed25519) verify_regular "$path" "$(record_value source_public_key_sha256)" 644 0 0 || return 1 ;;
       client-source-helper-executable.sha256.bin) verify_regular "$path" "$(record_value source_digest_sha256)" 644 0 0 || return 1 ;;
@@ -1012,9 +1151,11 @@ clear_remove_transaction() {
     "$remove_backup/usbip-linux-client-source-helper" \
     "$remove_backup/usbip-linux-client-source-helper.service" \
     "$remove_backup/usbip-linux-client-source-provision" \
+    "$remove_backup/usbip-linux-client-source-watch.service" \
     "$remove_backup/usbip-linux-client-vhci.service" \
     "$remove_backup/usbip-linux-client.conf" \
     "$remove_backup/usbip-linux-pairing" \
+    "$remove_backup/usbip-linux-source-port-control" \
     "$remove_backup/usbip-linux-master-usb-worker" \
     "$remove_backup/client-source-helper-peer.v1" \
     "$remove_backup/client-source-helper-public-key.ed25519" \
@@ -1046,16 +1187,17 @@ case "$mode" in
     [ "$#" -eq 3 ] && [ "$2" = "$ack" ] || usage
     [ "$(id -u)" -eq 0 ] || { echo "Installation requires root." >&2; exit 1; }
     user=$3
-    case "$user" in ''|root|-*|*[!A-Za-z0-9_.-]*) echo "Unsafe Client user name." >&2; exit 1 ;; esac
+    case "$user" in ''|-*|*[!A-Za-z0-9_.-]*) echo "Unsafe Client user name." >&2; exit 1 ;; esac
     verify_bundle
     host_gate
-    for command in find getent id install ln modinfo readlink systemctl systemd-tmpfiles; do require_command "$command"; done
+    for command in find getent id install ln modinfo readlink ss systemctl systemd-tmpfiles; do require_command "$command"; done
     user_record=$(getent passwd "$user")
     [ -n "$user_record" ] || { echo "Client user does not exist." >&2; exit 1; }
     client_uid=$(printf '%s\n' "$user_record" | awk -F: '{print $3}')
     client_gid=$(printf '%s\n' "$user_record" | awk -F: '{print $4}')
-    [ "$client_uid" -gt 0 ] || { echo "Root cannot be the Client user." >&2; exit 1; }
+    [ "$client_uid" -ge 0 ] || { echo "Invalid Client user UID." >&2; exit 1; }
     for path in "$package_root" "$entry_path" "$service_path" "$agent_service_path" "$source_service_path" \
+      "$source_watch_service_path" \
       "$source_peer_policy" "$source_public_key" "$source_digest" "$source_signing_key" \
       "$legacy_state_root" "$package_state"; do
       [ ! -e "$path" ] && [ ! -L "$path" ] || { echo "Refusing to overwrite an existing path: $path" >&2; exit 1; }
@@ -1073,23 +1215,30 @@ case "$mode" in
       echo "A root-owned, package-owned usbip tool is required; installer will not mutate packages." >&2
       exit 1
     }
+    usbipd_path=$(find_package_owned_usbipd) || {
+      echo "A root-owned, package-owned usbipd daemon is required for source sharing." >&2
+      exit 1
+    }
     if [ "$usbip_copy_source" != /usr/sbin/usbip ]; then
       # A tracked copy is only ever created on an unoccupied path, so rollback
       # and removal can delete it without destroying foreign state.
       [ ! -e /usr/sbin/usbip ] && [ ! -L /usr/sbin/usbip ] || { echo "Refusing to overwrite an existing path: /usr/sbin/usbip" >&2; exit 1; }
       usbip_copy_created=1
     fi
-    getent group usbip >/dev/null || { echo "Pre-existing usbip group is required; installer will not mutate accounts." >&2; exit 1; }
-    id -nG "$user" | tr ' ' '\n' | grep -Fxq usbip || { echo "Client user must already belong to usbip; installer will not mutate accounts." >&2; exit 1; }
+    if [ "$client_uid" -ne 0 ]; then
+      getent group usbip >/dev/null || { echo "Pre-existing usbip group is required; installer will not mutate accounts." >&2; exit 1; }
+      id -nG "$user" | tr ' ' '\n' | grep -Fxq usbip || { echo "Client user must already belong to usbip; installer will not mutate accounts." >&2; exit 1; }
+    fi
     rollback_install() {
       status=$?
       trap - EXIT HUP INT TERM
       if [ "$install_complete" -eq 0 ]; then
         systemctl disable --now usbip-linux-client.service usbip-linux-client-vhci.service \
-          usbip-linux-client-source-helper.service >/dev/null 2>&1 || true
+          usbip-linux-client-source-helper.service usbip-linux-client-source-watch.service >/dev/null 2>&1 || true
         rm -f -- "$entry_path" "$service_path" "$agent_service_path" "$client_path" \
-          "$source_service_path" "$helper_path" "$authority_tool_path" "$pairing_tool_path" \
+          "$source_service_path" "$source_watch_service_path" "$helper_path" "$authority_tool_path" "$pairing_tool_path" \
           "$source_helper_path" "$source_provision_path" "$source_worker_path" \
+          "$source_control_path" \
           "$source_peer_policy" "$source_public_key" "$source_digest" "$source_signing_key" \
           "$install_record"
         [ "$authority_preexisting" -eq 1 ] || rm -f -- "$authority_path"
@@ -1112,7 +1261,14 @@ case "$mode" in
 
     modinfo usbip_core >/dev/null && modinfo vhci_hcd >/dev/null || { echo "Running kernel lacks USB/IP Client modules." >&2; exit 1; }
     helper_gid=$(getent group usbip | awk -F: '{print $3}')
-    [ "$helper_gid" -gt 0 ] || exit 1
+    if [ -z "$helper_gid" ]; then
+      if [ "$client_uid" -eq 0 ]; then
+        helper_gid=0
+      else
+        echo "Pre-existing usbip group is required; installer will not mutate accounts." >&2
+        exit 1
+      fi
+    fi
     if [ -e "$state_root" ] || [ -L "$state_root" ]; then
       validate_state_tree "$state_root" "$client_uid" "$client_gid" || { echo "Preserved Client state is unsafe." >&2; exit 1; }
       state_preexisting=1
@@ -1146,9 +1302,12 @@ case "$mode" in
     install -o root -g root -m 0755 "$payload/usbip-linux-client-source-helper" "$source_helper_path"
     install -o root -g root -m 0755 "$payload/usbip-linux-client-source-provision" "$source_provision_path"
     install -o root -g root -m 0755 "$payload/usbip-linux-master-usb-worker" "$source_worker_path"
+    install -o root -g root -m 0755 "$payload/usbip-linux-source-port-control" "$source_control_path"
     ln -s -- "$client_path" "$entry_path"
     install -o root -g root -m 0644 "$payload/usbip-linux-client-vhci.service" "$service_path"
     install -o root -g root -m 0644 "$payload/usbip-linux-client-source-helper.service" "$source_service_path"
+    render_source_watch_service "$payload/usbip-linux-client-source-watch.service" \
+      "$source_watch_service_path" "$usbipd_path"
     render_agent_service "$payload/usbip-linux-client.service" "$agent_service_path" "$user" "$client_gid"
     "$source_provision_path" --client-uid "$client_uid" --client-gid "$client_gid"
     authority_temp=$(mktemp /etc/usbip-vhci-helper/.authority.v1.XXXXXX)
@@ -1158,7 +1317,7 @@ case "$mode" in
     printf '%s\n' usbip_core vhci_hcd > "$modules_temp"
     chown root:root "$modules_temp"; chmod 0644 "$modules_temp"; mv -T -- "$modules_temp" "$modules_path"
     install_vhci_tmpfiles
-    [ -d /run/vhci_hcd ] || { echo "The privileged helper's read-only VHCI path could not be created." >&2; exit 1; }
+    [ -d /run/vhci_hcd ] || { echo "The privileged helper's VHCI runtime path could not be created." >&2; exit 1; }
     write_install_transaction files-installed "$user" "$client_uid" "$client_gid"
     packages_csv=$(printf '%s\n' "$newly_installed_packages" | awk '{$1=$1; gsub(/ /,","); print}')
     package_versions_csv=
@@ -1176,12 +1335,14 @@ case "$mode" in
     write_install_transaction daemon-reloading "$user" "$client_uid" "$client_gid"
     systemctl daemon-reload
     write_install_transaction services-enabling "$user" "$client_uid" "$client_gid"
-    systemctl enable usbip-linux-client-vhci.service usbip-linux-client-source-helper.service usbip-linux-client.service
+    systemctl enable usbip-linux-client-vhci.service usbip-linux-client-source-helper.service \
+      usbip-linux-client-source-watch.service usbip-linux-client.service
     write_install_transaction helper-starting "$user" "$client_uid" "$client_gid"
     installed_user=$user
     installed_uid=$client_uid
     installed_gid=$client_gid
     source_helper_recorded=1
+    source_watch_recorded=1
     lifecycle_operation=install
     start_service_set
     "$helper_path" --check-peer-pidfd >/dev/null
@@ -1204,7 +1365,7 @@ case "$mode" in
     [ "$(sed -n '1p' "$install_transaction")" = USBIP_LINUX_CLIENT_INSTALL_TRANSACTION_V1 ] || exit 1
     [ "$(sed -n '2p' "$install_transaction")" = operation=install ] || exit 1
     recovery_phase=$(sed -n '3s/^phase=//p' "$install_transaction")
-    case "$recovery_phase" in pre-mutation|files-installed|daemon-reloading|services-enabling|helper-starting|committing) ;; *) exit 1 ;; esac
+    case "$recovery_phase" in pre-mutation|files-installed|daemon-reloading|services-enabling|helper-starting|source-helper-starting|source-watch-starting|agent-starting|agent-health-checking|committing) ;; *) exit 1 ;; esac
     recovery_user=$(sed -n '4s/^client_user=//p' "$install_transaction")
     recovery_uid=$(sed -n '5s/^client_uid=//p' "$install_transaction")
     recovery_gid=$(sed -n '6s/^client_gid=//p' "$install_transaction")
@@ -1223,6 +1384,11 @@ case "$mode" in
       verify_regular "$source_service_path" "$(sha256sum "$payload/usbip-linux-client-source-helper.service" | awk '{print $1}')" 644 0 0 || exit 1
       systemctl disable --now usbip-linux-client-source-helper.service >/dev/null 2>&1 || true
     fi
+    if [ -e "$source_watch_service_path" ]; then
+      verify_rendered_source_watch_service "$source_watch_service_path" \
+        "$payload/usbip-linux-client-source-watch.service" || exit 1
+      systemctl disable --now usbip-linux-client-source-watch.service >/dev/null 2>&1 || true
+    fi
     for pair in \
       "$client_path:$payload/usbip-linux-client" \
       "$helper_path:$payload/usbip-linux-vhci-helper" \
@@ -1230,7 +1396,8 @@ case "$mode" in
       "$pairing_tool_path:$payload/usbip-linux-pairing" \
       "$source_helper_path:$payload/usbip-linux-client-source-helper" \
       "$source_provision_path:$payload/usbip-linux-client-source-provision" \
-      "$source_worker_path:$payload/usbip-linux-master-usb-worker"; do
+      "$source_worker_path:$payload/usbip-linux-master-usb-worker" \
+      "$source_control_path:$payload/usbip-linux-source-port-control"; do
       installed=${pair%%:*}; bundled=${pair#*:}
       if [ -e "$installed" ]; then
         verify_regular "$installed" "$(sha256sum "$bundled" | awk '{print $1}')" 755 0 0 || exit 1
@@ -1254,8 +1421,9 @@ vhci_hcd' ] || exit 1
       validate_state_tree "$state_root" "$recovery_uid" "$recovery_gid" || exit 1
     fi
     rm -f -- "$entry_path" "$service_path" "$agent_service_path" "$client_path" \
-      "$source_service_path" "$helper_path" "$authority_tool_path" "$pairing_tool_path" \
+      "$source_service_path" "$source_watch_service_path" "$helper_path" "$authority_tool_path" "$pairing_tool_path" \
       "$source_helper_path" "$source_provision_path" "$source_worker_path" \
+      "$source_control_path" \
       "$source_peer_policy" "$source_public_key" "$source_digest" "$source_signing_key" \
       "$install_record"
     systemctl daemon-reload >/dev/null 2>&1 || true
@@ -1271,7 +1439,11 @@ vhci_hcd' ] || exit 1
     verify_installed
     [ "$(metadata_value target)" = "$installed_target" ] || { echo "Upgrade target differs from installed architecture." >&2; exit 1; }
     write_upgrade_record stage-creating
-    stage_upgrade_payload "$installed_user" "$installed_gid"
+    usbipd_path=$(find_package_owned_usbipd) || {
+      echo "A root-owned, package-owned usbipd daemon is required for source sharing." >&2
+      exit 1
+    }
+    stage_upgrade_payload "$installed_user" "$installed_gid" "$usbipd_path"
     write_upgrade_record staged
     lifecycle_operation=upgrade
     stop_and_quiesce || { lifecycle_operation=rollback; start_service_set >/dev/null 2>&1 || true; echo "Service set could not be quiesced; upgrade refused." >&2; exit 1; }
@@ -1284,6 +1456,7 @@ vhci_hcd' ] || exit 1
       status=$?
       trap - EXIT HUP INT TERM
       if [ "$upgrade_complete" -eq 0 ] && [ -d "$upgrade_backup" ]; then
+        systemctl stop usbip-linux-client-source-watch.service >/dev/null 2>&1 || true
         write_upgrade_record rollback-payload-restoring >/dev/null 2>&1 || true
         restore_client_upgrade_backup >/dev/null 2>&1 || true
         write_upgrade_record rollback-daemon-reloading >/dev/null 2>&1 || true
@@ -1306,21 +1479,25 @@ vhci_hcd' ] || exit 1
     install -o root -g root -m 0755 "$prepared_stage/usbip-linux-client-source-helper" "$source_helper_path"
     install -o root -g root -m 0755 "$prepared_stage/usbip-linux-client-source-provision" "$source_provision_path"
     install -o root -g root -m 0755 "$prepared_stage/usbip-linux-master-usb-worker" "$source_worker_path"
+    install -o root -g root -m 0755 "$prepared_stage/usbip-linux-source-port-control" "$source_control_path"
     install -o root -g root -m 0644 "$prepared_stage/usbip-linux-client-vhci.service" "$service_path"
     install -o root -g root -m 0644 "$prepared_stage/usbip-linux-client.service" "$agent_service_path"
     install -o root -g root -m 0644 "$prepared_stage/usbip-linux-client-source-helper.service" "$source_service_path"
+    install -o root -g root -m 0644 "$prepared_stage/usbip-linux-client-source-watch.service" "$source_watch_service_path"
     if [ "$source_helper_recorded" -eq 1 ]; then
       "$source_provision_path" --refresh --client-uid "$installed_uid" --client-gid "$installed_gid"
     else
       "$source_provision_path" --client-uid "$installed_uid" --client-gid "$installed_gid"
     fi
     source_helper_recorded=1
+    source_watch_recorded=1
     write_install_record "$install_record" "$installed_target" "$installed_user" "$installed_uid" "$installed_gid" "$helper_gid" "$group_created" "$membership_added" "$usbip_core_was_loaded" "$vhci_hcd_was_loaded" "$usbip_copy_created" "$(printf '%s' "$owned_packages" | tr ' ' ',')" "$(printf '%s' "$owned_package_versions" | tr ' ' ',')"
     write_upgrade_record payload-replaced
     verify_regular "$service_path" "$(metadata_value service_sha256)" 644 0 0 || exit 1
     verify_regular "$agent_service_path" "$(sha256sum "$prepared_stage/usbip-linux-client.service" | awk '{print $1}')" 644 0 0 || exit 1
     write_upgrade_record daemon-reloading
     systemctl daemon-reload
+    systemctl enable usbip-linux-client-source-watch.service
     lifecycle_operation=upgrade
     start_service_set
     write_upgrade_record committing
@@ -1337,11 +1514,11 @@ vhci_hcd' ] || exit 1
     [ "$(wc -l < "$upgrade_record")" -eq 2 ] && [ "$(sed -n '1p' "$upgrade_record")" = USBIP_LINUX_CLIENT_UPGRADE_V1 ] || exit 1
     upgrade_stage=$(sed -n '2s/^stage=//p' "$upgrade_record")
     case "$upgrade_stage" in
-      stage-creating|staged|agent-draining|agent-stopping|source-helper-stopping|helper-stopping|stopped|backup-creating|backup-complete|state-migrating|payload-replacing|payload-replaced|daemon-reloading|helper-starting|source-helper-starting|agent-starting|agent-health-checking|committing|rollback-*) ;;
+      stage-creating|staged|agent-draining|agent-stopping|source-watch-stopping|source-helper-stopping|helper-stopping|stopped|backup-creating|backup-complete|state-migrating|payload-replacing|payload-replaced|daemon-reloading|helper-starting|source-helper-starting|source-watch-starting|agent-starting|agent-health-checking|committing|rollback-*) ;;
       *) exit 1 ;;
     esac
     case "$upgrade_stage" in
-      stage-creating|staged|agent-draining|agent-stopping|source-helper-stopping|helper-stopping|stopped|backup-creating)
+      stage-creating|staged|agent-draining|agent-stopping|source-watch-stopping|source-helper-stopping|helper-stopping|stopped|backup-creating)
         load_install_record
         validate_partial_upgrade_backup || { echo "Partial upgrade backup changed; recovery refused." >&2; exit 1; }
         lifecycle_operation=rollback
@@ -1356,6 +1533,7 @@ vhci_hcd' ] || exit 1
           write_upgrade_record rollback-helper-stopping
           systemctl stop usbip-linux-client-vhci.service >/dev/null 2>&1 || true
           systemctl stop usbip-linux-client-source-helper.service >/dev/null 2>&1 || true
+          systemctl stop usbip-linux-client-source-watch.service >/dev/null 2>&1 || true
           write_upgrade_record rollback-payload-restoring
           restore_client_upgrade_backup
           write_upgrade_record rollback-daemon-reloading
@@ -1386,20 +1564,22 @@ vhci_hcd' ] || exit 1
     [ "$(id -u)" -eq 0 ] || { echo "Removal requires root." >&2; exit 1; }
     for command in cp find getent id readlink sha256sum sort stat systemctl; do require_command "$command"; done
     verify_installed
-    [ "$agent_service_recorded" -eq 1 ] || { echo "Upgrade the legacy Client service set before removal." >&2; exit 1; }
+    [ "$agent_service_recorded" -eq 1 ] && [ "$source_watch_recorded" -eq 1 ] || { echo "Upgrade the legacy Client service set before removal." >&2; exit 1; }
     package_database_healthy || { echo "Package manager requires repair or cannot prove database integrity before removal." >&2; exit 1; }
     write_remove_record intent
     lifecycle_operation=remove
     stop_and_quiesce || { lifecycle_operation=remove; start_service_set >/dev/null 2>&1 || true; echo "Service set could not be quiesced; removal refused and restart requested." >&2; exit 1; }
     write_remove_record stopped
     write_remove_record services-disabling
-    systemctl disable usbip-linux-client.service usbip-linux-client-source-helper.service usbip-linux-client-vhci.service || { lifecycle_operation=remove; start_service_set >/dev/null 2>&1 || true; exit 1; }
+    systemctl disable usbip-linux-client.service usbip-linux-client-source-helper.service \
+      usbip-linux-client-source-watch.service usbip-linux-client-vhci.service || { lifecycle_operation=remove; start_service_set >/dev/null 2>&1 || true; exit 1; }
     write_remove_record backup-creating
     mkdir -m 0700 "$remove_backup"
     cp -p -- "$install_record" "$remove_backup/install.v1"
     cp -p -- "$client_path" "$helper_path" "$authority_tool_path" "$pairing_tool_path" \
       "$source_helper_path" "$source_provision_path" "$source_worker_path" \
-      "$service_path" "$agent_service_path" "$source_service_path" "$authority_path" \
+      "$source_control_path" "$service_path" "$agent_service_path" "$source_service_path" \
+      "$source_watch_service_path" "$authority_path" \
       "$source_peer_policy" "$source_public_key" "$source_digest" "$source_signing_key" \
       "$modules_path" /usr/sbin/usbip "$remove_backup/"
     for backup_file in "$remove_backup"/*; do sync -f "$backup_file"; done
@@ -1420,8 +1600,10 @@ vhci_hcd' ] || exit 1
     [ -z "$owned_packages" ] && [ -z "$owned_package_versions" ] || { echo "Product installs never own packages." >&2; exit 1; }
     write_remove_record deleting
     rm -f -- "$entry_path" "$service_path" "$agent_service_path" "$source_service_path" \
+      "$source_watch_service_path" \
       "$client_path" "$helper_path" "$authority_tool_path" "$pairing_tool_path" \
       "$source_helper_path" "$source_provision_path" "$source_worker_path" \
+      "$source_control_path" \
       "$source_peer_policy" "$source_public_key" "$source_digest" "$source_signing_key"
     remove_vhci_tmpfiles
     [ "$usbip_copy_created" -ne 1 ] || rm -f -- /usr/sbin/usbip
@@ -1444,13 +1626,14 @@ vhci_hcd' ] || exit 1
       echo "Removal journal shape changed." >&2
       exit 1
     }
-    case "$remove_stage" in intent|agent-draining|agent-stopping|source-helper-stopping|helper-stopping|stopped|services-disabling|backup-creating|backup-complete|deleting|daemon-reloading|committing|rollback-*) ;; *) echo "Removal journal stage changed." >&2; exit 1 ;; esac
+    case "$remove_stage" in intent|agent-draining|agent-stopping|source-watch-stopping|source-helper-stopping|helper-stopping|stopped|services-disabling|backup-creating|backup-complete|deleting|daemon-reloading|committing|rollback-*) ;; *) echo "Removal journal stage changed." >&2; exit 1 ;; esac
     case "$remove_stage" in
-      intent|agent-draining|agent-stopping|source-helper-stopping|helper-stopping|stopped|services-disabling|backup-creating)
+      intent|agent-draining|agent-stopping|source-watch-stopping|source-helper-stopping|helper-stopping|stopped|services-disabling|backup-creating)
         load_install_record
         validate_partial_remove_backup || { echo "Partial removal backup changed; recovery refused." >&2; exit 1; }
         install_vhci_tmpfiles
-        systemctl enable usbip-linux-client.service usbip-linux-client-source-helper.service usbip-linux-client-vhci.service
+        systemctl enable usbip-linux-client.service usbip-linux-client-source-helper.service \
+          usbip-linux-client-source-watch.service usbip-linux-client-vhci.service
         lifecycle_operation=remove
         start_service_set
         clear_remove_transaction keep-install
@@ -1458,8 +1641,10 @@ vhci_hcd' ] || exit 1
         ;;
       committing)
         rm -f -- "$entry_path" "$service_path" "$agent_service_path" "$source_service_path" \
+          "$source_watch_service_path" \
           "$client_path" "$helper_path" "$authority_tool_path" "$pairing_tool_path" \
           "$source_helper_path" "$source_provision_path" "$source_worker_path" \
+          "$source_control_path" \
           "$source_peer_policy" "$source_public_key" "$source_digest" "$source_signing_key"
         remove_vhci_tmpfiles
         if [ -f "$remove_backup/install.v1" ] && grep -qx 'usbip_copy_created=1' "$remove_backup/install.v1"; then
@@ -1501,9 +1686,11 @@ vhci_hcd' ] || exit 1
         install -o root -g root -m 0755 "$remove_backup/usbip-linux-client-source-helper" "$source_helper_path"
         install -o root -g root -m 0755 "$remove_backup/usbip-linux-client-source-provision" "$source_provision_path"
         install -o root -g root -m 0755 "$remove_backup/usbip-linux-master-usb-worker" "$source_worker_path"
+        install -o root -g root -m 0755 "$remove_backup/usbip-linux-source-port-control" "$source_control_path"
         install -o root -g root -m 0644 "$remove_backup/usbip-linux-client-vhci.service" "$service_path"
         install -o root -g root -m 0644 "$remove_backup/usbip-linux-client.service" "$agent_service_path"
         install -o root -g root -m 0644 "$remove_backup/usbip-linux-client-source-helper.service" "$source_service_path"
+        install -o root -g root -m 0644 "$remove_backup/usbip-linux-client-source-watch.service" "$source_watch_service_path"
         install -o root -g root -m 0600 "$remove_backup/client-source-helper-peer.v1" "$source_peer_policy"
         install -o root -g root -m 0644 "$remove_backup/client-source-helper-public-key.ed25519" "$source_public_key"
         install -o root -g root -m 0644 "$remove_backup/client-source-helper-executable.sha256.bin" "$source_digest"
@@ -1516,7 +1703,8 @@ vhci_hcd' ] || exit 1
         ln -s -- "$client_path" "$entry_path"
         write_remove_record rollback-daemon-reloading
         systemctl daemon-reload
-        systemctl enable usbip-linux-client.service usbip-linux-client-source-helper.service usbip-linux-client-vhci.service
+        systemctl enable usbip-linux-client.service usbip-linux-client-source-helper.service \
+          usbip-linux-client-source-watch.service usbip-linux-client-vhci.service
         lifecycle_operation=remove
         start_service_set || { echo "Client service set did not become ready during removal recovery." >&2; exit 1; }
         clear_remove_transaction keep-install
